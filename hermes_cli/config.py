@@ -1934,6 +1934,28 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
         "advanced": True,
     },
+    "BROWSERLESS_API_KEY": {
+        "description": "Browserless API key for cloud browser (optional — local browser works without this)",
+        "prompt": "Browserless API key",
+        "url": "https://browserless.io/",
+        "tools": ["browser_navigate", "browser_click"],
+        "password": True,
+        "category": "tool",
+    },
+    "BROWSERLESS_BASE_URL": {
+        "description": "Browserless base URL for region or self-hosted instance (optional, default https://production-sfo.browserless.io)",
+        "prompt": "Browserless base URL (leave empty for production-sfo)",
+        "tools": ["browser_navigate", "browser_click"],
+        "password": False,
+        "category": "tool",
+    },
+    "BROWSERLESS_SESSION_TTL_MS": {
+        "description": "Browserless session TTL in milliseconds (optional, default 300000 = 5 minutes)",
+        "prompt": "Browser session TTL (ms)",
+        "tools": ["browser_navigate", "browser_click"],
+        "password": False,
+        "category": "tool",
+    },
     "CAMOFOX_URL": {
         "description": "Camofox browser server URL for local anti-detection browsing (e.g. http://localhost:9377)",
         "prompt": "Camofox server URL",
@@ -4554,6 +4576,7 @@ def show_config():
         ("TAVILY_API_KEY", "Tavily"),
         ("BROWSERBASE_API_KEY", "Browserbase"),
         ("BROWSER_USE_API_KEY", "Browser Use"),
+        ("BROWSERLESS_API_KEY", "Browserless"),
         ("FAL_KEY", "FAL"),
     ]
     

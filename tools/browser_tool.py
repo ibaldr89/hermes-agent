@@ -4,9 +4,10 @@ Browser Tool Module
 
 This module provides browser automation tools using agent-browser CLI.  It
 supports multiple backends — **Browser Use** (cloud, default for Nous
-subscribers), **Browserbase** (cloud, direct credentials), and **local
-Chromium** — with identical agent-facing behaviour.  The backend is
-auto-detected from config and available credentials.
+subscribers), **Browserbase** (cloud, direct credentials), **Browserless**
+(cloud, direct credentials), **Firecrawl** (cloud), and **local Chromium** —
+with identical agent-facing behaviour.  The backend is auto-detected from
+config and available credentials.
 
 The tool uses agent-browser's accessibility tree (ariaSnapshot) for text-based
 page representation, making it ideal for LLM agents without vision capabilities.
@@ -17,7 +18,8 @@ Features:
   ``agent-browser install`` (downloads Chromium) or
   ``agent-browser install --with-deps`` (also installs system libraries for
   Debian/Ubuntu/Docker).
-- **Cloud mode**: Browserbase or Browser Use cloud execution when configured.
+- **Cloud mode**: Browserbase, Browser Use, Browserless, or Firecrawl cloud
+  execution when configured.
 - Session isolation per task ID
 - Text-based page snapshots using accessibility tree
 - Element interaction via ref selectors (@e1, @e2, etc.)
@@ -35,6 +37,12 @@ Environment Variables:
   requires paid plan (default: "true")
 - BROWSERBASE_SESSION_TIMEOUT: Custom session timeout in milliseconds. Set to extend
   beyond project default. Common values: 600000 (10min), 1800000 (30min) (default: none)
+- BROWSERLESS_API_KEY: API key for direct Browserless cloud mode
+- BROWSERLESS_BASE_URL: Region / self-host URL override (default: https://production-sfo.browserless.io)
+- BROWSERLESS_SESSION_TTL_MS: Per-session TTL in ms (default: 300000 = 5 min)
+- BROWSERLESS_STEALTH: Enable stealth mode (default: "false")
+- BROWSERLESS_BLOCK_ADS: Enable ad blocking (default: "false")
+- BROWSERLESS_PROCESS_KEEP_ALIVE_MS: Reconnect window in ms (default: 0 = disabled)
 
 Usage:
     from tools.browser_tool import browser_navigate, browser_snapshot, browser_click
@@ -86,6 +94,7 @@ except Exception:
 from tools.browser_providers.base import CloudBrowserProvider
 from tools.browser_providers.browserbase import BrowserbaseProvider
 from tools.browser_providers.browser_use import BrowserUseProvider
+from tools.browser_providers.browserless import BrowserlessProvider
 from tools.browser_providers.firecrawl import FirecrawlProvider
 from tools.tool_backend_helpers import normalize_browser_cloud_provider
 
@@ -394,6 +403,7 @@ def _stop_cdp_supervisor(task_id: str) -> None:
 _PROVIDER_REGISTRY: Dict[str, type] = {
     "browserbase": BrowserbaseProvider,
     "browser-use": BrowserUseProvider,
+    "browserless": BrowserlessProvider,
     "firecrawl": FirecrawlProvider,
 }
 
