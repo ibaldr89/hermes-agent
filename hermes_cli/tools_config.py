@@ -407,6 +407,16 @@ TOOL_CATEGORIES = {
                 "post_setup": "agent_browser",
             },
             {
+                "name": "Browserless",
+                "badge": "paid",
+                "tag": "Cloud browser via CDP (Puppeteer / Playwright)",
+                "env_vars": [
+                    {"key": "BROWSERLESS_API_KEY", "prompt": "Browserless API key", "url": "https://browserless.io"},
+                ],
+                "browser_provider": "browserless",
+                "post_setup": "agent_browser",
+            },
+            {
                 "name": "Camofox",
                 "badge": "free · local",
                 "tag": "Anti-detection browser (Firefox/Camoufox)",

@@ -140,6 +140,7 @@ def show_status(args):
         "Tavily": "TAVILY_API_KEY",
         "Browser Use": "BROWSER_USE_API_KEY",  # Optional — local browser works without this
         "Browserbase": "BROWSERBASE_API_KEY",  # Optional — direct credentials only
+        "Browserless": "BROWSERLESS_API_KEY",  # Optional — local browser works without this
         "FAL": "FAL_KEY",
         "Tinker": "TINKER_API_KEY",
         "WandB": "WANDB_API_KEY",
