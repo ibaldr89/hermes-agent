@@ -100,11 +100,14 @@ class TestCreateSession:
         assert result["bb_session_id"] == "sess_123"
         assert result["cdp_url"] == "wss://production-sfo.browserless.io/e/xyz?token=tok_abc"
         assert result["session_name"].startswith("hermes_task-minimal_")
-        assert result["features"] == {
-            "stealth": False,
-            "block_ads": False,
-            "process_keep_alive": False,
-        }
+        # Features dict includes new proxy/headless fields (all off by default)
+        features = result["features"]
+        assert features["stealth"] is False
+        assert features["block_ads"] is False
+        assert features["process_keep_alive"] is False
+        assert features["headless"] is True
+        assert features["residential_proxy"] is False
+        assert features["external_proxy"] is False
 
     def test_stealth_and_block_ads_forwarded(self, monkeypatch):
         monkeypatch.setenv("BROWSERLESS_API_KEY", "tok_abc")
@@ -347,6 +350,171 @@ class TestEmergencyCleanup:
             provider = BrowserlessProvider()
             # Must not propagate
             provider.emergency_cleanup("sess_123")
+
+
+# ---------------------------------------------------------------------------
+# Headless mode
+# ---------------------------------------------------------------------------
+
+
+class TestHeadlessMode:
+    def test_headless_true_by_default_omits_param(self, monkeypatch):
+        monkeypatch.setenv("BROWSERLESS_API_KEY", "tok_abc")
+        monkeypatch.delenv("BROWSERLESS_HEADLESS", raising=False)
+        monkeypatch.delenv("BROWSERLESS_EXTERNAL_PROXY", raising=False)
+        monkeypatch.delenv("BROWSERLESS_PROXY", raising=False)
+        captured = {}
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            captured["json"] = json
+            return _Response(200, payload={"id": "s", "connect": "wss://host/e/s?token=tok_abc"})
+
+        with patch.object(browserless_module.requests, "post", side_effect=fake_post):
+            BrowserlessProvider().create_session("task-headless-default")
+
+        # headless omitted when True — Browserless server defaults to headless
+        assert "headless" not in captured["json"]
+
+    def test_headless_false_sent_in_body(self, monkeypatch):
+        monkeypatch.setenv("BROWSERLESS_API_KEY", "tok_abc")
+        monkeypatch.setenv("BROWSERLESS_HEADLESS", "false")
+        monkeypatch.delenv("BROWSERLESS_EXTERNAL_PROXY", raising=False)
+        monkeypatch.delenv("BROWSERLESS_PROXY", raising=False)
+        captured = {}
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            captured["json"] = json
+            return _Response(200, payload={"id": "s", "connect": "wss://host/e/s?token=tok_abc"})
+
+        with patch.object(browserless_module.requests, "post", side_effect=fake_post):
+            BrowserlessProvider().create_session("task-headful")
+
+        assert captured["json"].get("headless") is False
+
+
+# ---------------------------------------------------------------------------
+# Built-in residential proxy
+# ---------------------------------------------------------------------------
+
+
+class TestResidentialProxy:
+    _BASE_CONNECT = "wss://production-sfo.browserless.io/e/xyz?token=tok_abc"
+
+    def _fake_post(self, url, headers=None, json=None, timeout=None):
+        return _Response(200, payload={"id": "sess_proxy", "connect": self._BASE_CONNECT})
+
+    def test_residential_proxy_params_on_connect_url(self, monkeypatch):
+        monkeypatch.setenv("BROWSERLESS_API_KEY", "tok_abc")
+        monkeypatch.setenv("BROWSERLESS_PROXY", "residential")
+        monkeypatch.setenv("BROWSERLESS_PROXY_COUNTRY", "us")
+        monkeypatch.delenv("BROWSERLESS_EXTERNAL_PROXY", raising=False)
+        monkeypatch.delenv("BROWSERLESS_PROXY_CITY", raising=False)
+        monkeypatch.delenv("BROWSERLESS_PROXY_STICKY", raising=False)
+        monkeypatch.delenv("BROWSERLESS_PROXY_LOCALE_MATCH", raising=False)
+
+        with patch.object(browserless_module.requests, "post", side_effect=self._fake_post):
+            result = BrowserlessProvider().create_session("task-proxy")
+
+        assert "proxy=residential" in result["cdp_url"]
+        assert "proxyCountry=us" in result["cdp_url"]
+        assert result["features"]["residential_proxy"] is True
+        assert result["features"]["external_proxy"] is False
+
+    def test_proxy_sticky_appended(self, monkeypatch):
+        monkeypatch.setenv("BROWSERLESS_API_KEY", "tok_abc")
+        monkeypatch.setenv("BROWSERLESS_PROXY", "residential")
+        monkeypatch.setenv("BROWSERLESS_PROXY_STICKY", "true")
+        monkeypatch.delenv("BROWSERLESS_PROXY_COUNTRY", raising=False)
+        monkeypatch.delenv("BROWSERLESS_PROXY_CITY", raising=False)
+        monkeypatch.delenv("BROWSERLESS_EXTERNAL_PROXY", raising=False)
+        monkeypatch.delenv("BROWSERLESS_PROXY_LOCALE_MATCH", raising=False)
+
+        with patch.object(browserless_module.requests, "post", side_effect=self._fake_post):
+            result = BrowserlessProvider().create_session("task-sticky")
+
+        assert "proxySticky=true" in result["cdp_url"]
+
+    def test_no_proxy_env_no_params(self, monkeypatch):
+        monkeypatch.setenv("BROWSERLESS_API_KEY", "tok_abc")
+        monkeypatch.delenv("BROWSERLESS_PROXY", raising=False)
+        monkeypatch.delenv("BROWSERLESS_EXTERNAL_PROXY", raising=False)
+
+        def fake_no_proxy(url, headers=None, json=None, timeout=None):
+            return _Response(200, payload={"id": "s", "connect": "wss://host/e/s?token=tok_abc"})
+
+        with patch.object(browserless_module.requests, "post", side_effect=fake_no_proxy):
+            result = BrowserlessProvider().create_session("task-no-proxy")
+
+        assert "proxy" not in result["cdp_url"]
+        assert result["features"]["residential_proxy"] is False
+        assert result["features"]["external_proxy"] is False
+
+    def test_append_query_params_preserves_existing(self):
+        provider = BrowserlessProvider()
+        url = "wss://host/e/abc?token=tok&foo=bar"
+        result = provider._append_query_params(url, {"proxy": "residential", "proxyCountry": "de"})
+        assert "token=tok" in result
+        assert "foo=bar" in result
+        assert "proxy=residential" in result
+        assert "proxyCountry=de" in result
+
+
+# ---------------------------------------------------------------------------
+# External (third-party) proxy
+# ---------------------------------------------------------------------------
+
+
+class TestExternalProxy:
+    def test_external_proxy_sent_in_session_body(self, monkeypatch):
+        monkeypatch.setenv("BROWSERLESS_API_KEY", "tok_abc")
+        monkeypatch.setenv("BROWSERLESS_EXTERNAL_PROXY", "socks5://user:pass@proxy.example.com:1080")
+        monkeypatch.delenv("BROWSERLESS_PROXY", raising=False)
+        captured = {}
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            captured["json"] = json
+            return _Response(200, payload={"id": "s", "connect": "wss://host/e/s?token=tok_abc"})
+
+        with patch.object(browserless_module.requests, "post", side_effect=fake_post):
+            result = BrowserlessProvider().create_session("task-ext-proxy")
+
+        assert captured["json"]["externalProxy"] == "socks5://user:pass@proxy.example.com:1080"
+        assert result["features"]["external_proxy"] is True
+
+    def test_external_proxy_401_retries_without_proxy(self, monkeypatch):
+        """If external proxy returns 401 (plan limitation), retry without it."""
+        monkeypatch.setenv("BROWSERLESS_API_KEY", "tok_abc")
+        monkeypatch.setenv("BROWSERLESS_EXTERNAL_PROXY", "http://proxy.example.com:8080")
+        monkeypatch.delenv("BROWSERLESS_PROXY", raising=False)
+        call_count = 0
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _Response(401, text="Unauthorized")
+            return _Response(200, payload={"id": "s", "connect": "wss://host/e/s?token=tok_abc"})
+
+        with patch.object(browserless_module.requests, "post", side_effect=fake_post):
+            result = BrowserlessProvider().create_session("task-ext-proxy-fallback")
+
+        assert call_count == 2
+        assert result["features"]["external_proxy"] is False
+
+    def test_external_proxy_not_sent_when_empty(self, monkeypatch):
+        monkeypatch.setenv("BROWSERLESS_API_KEY", "tok_abc")
+        monkeypatch.setenv("BROWSERLESS_EXTERNAL_PROXY", "")
+        monkeypatch.delenv("BROWSERLESS_PROXY", raising=False)
+        captured = {}
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            captured["json"] = json
+            return _Response(200, payload={"id": "s", "connect": "wss://host/e/s?token=tok_abc"})
+
+        with patch.object(browserless_module.requests, "post", side_effect=fake_post):
+            BrowserlessProvider().create_session("task-no-ext-proxy")
+
+        assert "externalProxy" not in captured["json"]
 
 
 # ---------------------------------------------------------------------------

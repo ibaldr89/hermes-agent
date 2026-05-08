@@ -3,7 +3,8 @@
 import logging
 import os
 import uuid
-from typing import Dict
+from typing import Dict, Optional
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qs
 
 import requests
 
@@ -31,21 +32,43 @@ class BrowserlessProvider(CloudBrowserProvider):
                                          (default: 300000 = 5 min).
         BROWSERLESS_STEALTH  (optional)  ``true`` → enable stealth mode.
         BROWSERLESS_BLOCK_ADS (optional) ``true`` → enable ad blocking.
+        BROWSERLESS_HEADLESS (optional)  ``false`` → headful mode (default: true).
         BROWSERLESS_PROCESS_KEEP_ALIVE_MS (optional) Reconnect window in
                                          ms (default: 0 = disabled).
+
+        # Built-in residential proxy (paid plan required):
+        BROWSERLESS_PROXY    (optional)  ``residential`` → route through
+                                         Browserless residential proxy pool.
+        BROWSERLESS_PROXY_COUNTRY (optional) ISO 3166 country code for
+                                         proxy geolocation (e.g. ``us``, ``de``).
+        BROWSERLESS_PROXY_CITY (optional) City for geo-routing (Scale plan
+                                         only, 500k+ units).
+        BROWSERLESS_PROXY_STICKY (optional) ``true`` → reuse same exit IP
+                                         across the entire session.
+        BROWSERLESS_PROXY_LOCALE_MATCH (optional) ``true`` → auto-set browser
+                                         language to match proxy country
+                                         (stealth endpoints only).
+
+        # Third-party / external proxy:
+        BROWSERLESS_EXTERNAL_PROXY (optional) Full proxy URL passed to
+                                         Browserless as ``externalProxy`` in
+                                         the session body.  Supports HTTP,
+                                         HTTPS, SOCKS4, SOCKS5 with optional
+                                         credentials, e.g.
+                                         ``socks5://user:pass@host:port``.
     """
 
     def provider_name(self) -> str:
         return "Browserless"
 
     # ------------------------------------------------------------------
-    # Configuration
+    # Configuration helpers
     # ------------------------------------------------------------------
 
     def _base_url(self) -> str:
         return os.environ.get("BROWSERLESS_BASE_URL", _DEFAULT_BASE_URL).rstrip("/")
 
-    def _api_key_or_none(self) -> str | None:
+    def _api_key_or_none(self) -> Optional[str]:
         key = os.environ.get("BROWSERLESS_API_KEY", "").strip()
         return key or None
 
@@ -62,7 +85,7 @@ class BrowserlessProvider(CloudBrowserProvider):
         return self._api_key_or_none() is not None
 
     # ------------------------------------------------------------------
-    # Session lifecycle
+    # Session parameter helpers
     # ------------------------------------------------------------------
 
     def _session_ttl_ms(self) -> int:
@@ -100,6 +123,63 @@ class BrowserlessProvider(CloudBrowserProvider):
             )
             return 0
 
+    def _proxy_query_params(self) -> Dict[str, str]:
+        """Build query-string proxy params for the connect WebSocket URL.
+
+        Browserless residential proxy is configured via query params appended
+        to the ``connect`` URL returned by POST /session, NOT via the session
+        body.  This method returns a dict of params to append.
+        """
+        proxy_type = os.environ.get("BROWSERLESS_PROXY", "").strip().lower()
+        if not proxy_type:
+            return {}
+
+        params: Dict[str, str] = {"proxy": proxy_type}
+
+        country = os.environ.get("BROWSERLESS_PROXY_COUNTRY", "").strip().lower()
+        if country:
+            params["proxyCountry"] = country
+
+        city = os.environ.get("BROWSERLESS_PROXY_CITY", "").strip()
+        if city:
+            params["proxyCity"] = city
+
+        sticky = os.environ.get("BROWSERLESS_PROXY_STICKY", "").strip().lower()
+        if sticky in ("1", "true", "yes"):
+            params["proxySticky"] = "true"
+
+        locale_match = os.environ.get("BROWSERLESS_PROXY_LOCALE_MATCH", "").strip().lower()
+        if locale_match in ("1", "true", "yes"):
+            params["proxyLocaleMatch"] = "1"
+
+        return params
+
+    def _external_proxy(self) -> Optional[str]:
+        """Return third-party proxy URL if configured, else None."""
+        val = os.environ.get("BROWSERLESS_EXTERNAL_PROXY", "").strip()
+        return val or None
+
+    # ------------------------------------------------------------------
+    # Connect URL augmentation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _append_query_params(url: str, params: Dict[str, str]) -> str:
+        """Append extra query params to a URL (wss:// or https://)."""
+        if not params:
+            return url
+        parsed = urlparse(url)
+        existing = parse_qs(parsed.query, keep_blank_values=True)
+        # urlencode flattens lists — keep first value for existing keys
+        flat_existing = {k: v[0] for k, v in existing.items()}
+        merged = {**flat_existing, **params}  # new params win
+        new_query = urlencode(merged)
+        return urlunparse(parsed._replace(query=new_query))
+
+    # ------------------------------------------------------------------
+    # Session lifecycle
+    # ------------------------------------------------------------------
+
     def create_session(self, task_id: str) -> Dict[str, object]:
         api_key = self._api_key()
         base = self._base_url()
@@ -108,6 +188,9 @@ class BrowserlessProvider(CloudBrowserProvider):
         keep_alive_ms = self._process_keep_alive_ms()
         stealth = os.environ.get("BROWSERLESS_STEALTH", "").strip().lower() == "true"
         block_ads = os.environ.get("BROWSERLESS_BLOCK_ADS", "").strip().lower() == "true"
+        headless = os.environ.get("BROWSERLESS_HEADLESS", "true").strip().lower() != "false"
+        proxy_params = self._proxy_query_params()
+        external_proxy = self._external_proxy()
 
         body: Dict[str, object] = {"ttl": ttl_ms}
         if keep_alive_ms:
@@ -117,11 +200,18 @@ class BrowserlessProvider(CloudBrowserProvider):
             body["stealth"] = True
         if block_ads:
             body["blockAds"] = True
+        if not headless:
+            body["headless"] = False
+        if external_proxy:
+            body["externalProxy"] = external_proxy
 
         features_enabled = {
             "stealth": stealth,
             "block_ads": block_ads,
+            "headless": headless,
             "process_keep_alive": bool(keep_alive_ms),
+            "residential_proxy": bool(proxy_params),
+            "external_proxy": bool(external_proxy),
         }
 
         try:
@@ -135,6 +225,24 @@ class BrowserlessProvider(CloudBrowserProvider):
             raise RuntimeError(
                 f"Failed to reach Browserless at {base}: {exc}"
             ) from exc
+
+        # 401 on proxy params = paid feature not on this plan — retry without
+        if response.status_code == 401 and external_proxy:
+            logger.warning(
+                "External proxy rejected (401) — plan may not support it. "
+                "Retrying without externalProxy."
+            )
+            body.pop("externalProxy", None)
+            features_enabled["external_proxy"] = False
+            try:
+                response = requests.post(
+                    f"{base}/session?token={api_key}",
+                    headers={"Content-Type": "application/json"},
+                    json=body,
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                raise RuntimeError(f"Failed to reach Browserless at {base}: {exc}") from exc
 
         if not response.ok:
             raise RuntimeError(
@@ -152,9 +260,18 @@ class BrowserlessProvider(CloudBrowserProvider):
                 f"Unexpected Browserless response (missing {exc.args[0]}): {data}"
             ) from exc
 
+        # Residential proxy params go on the connect WebSocket URL as query params
+        if proxy_params:
+            connect_url = self._append_query_params(connect_url, proxy_params)
+            logger.debug(
+                "Browserless residential proxy enabled: %s",
+                ", ".join(f"{k}={v}" for k, v in proxy_params.items()),
+            )
+
         session_name = f"hermes_{task_id}_{uuid.uuid4().hex[:8]}"
 
-        feature_str = ", ".join(k for k, v in features_enabled.items() if v) or "none"
+        active_features = [k for k, v in features_enabled.items() if v]
+        feature_str = ", ".join(active_features) or "none"
         logger.info(
             "Created Browserless session %s (id=%s, features: %s)",
             session_name,
