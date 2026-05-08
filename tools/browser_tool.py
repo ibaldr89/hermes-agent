@@ -368,6 +368,22 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
             cdp_url = _resolve_cdp_override(maybe)
     if not cdp_url:
         return
+
+    # Browserless allows only ONE WebSocket connection per session.
+    # The supervisor would occupy that slot, leaving agent-browser --cdp with
+    # a 429 on its own connect attempt.  Skip the supervisor for Browserless.
+    try:
+        provider = _get_cloud_provider()
+        if isinstance(provider, BrowserlessProvider):
+            logger.debug(
+                "CDP supervisor skipped for task=%s — Browserless does not allow "
+                "concurrent WebSocket connections on the same session",
+                task_id,
+            )
+            return
+    except Exception:
+        pass
+
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
 
