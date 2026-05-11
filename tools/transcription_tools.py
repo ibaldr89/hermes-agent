@@ -2,7 +2,7 @@
 """
 Transcription Tools Module
 
-Provides speech-to-text transcription with six providers:
+Provides speech-to-text transcription with seven providers:
 
   - **local** (default, free) — faster-whisper running locally, no API key needed.
     Auto-downloads the model (~150 MB for ``base``) on first use.
@@ -11,11 +11,13 @@ Provides speech-to-text transcription with six providers:
   - **mistral** — Mistral Voxtral Transcribe API, requires ``MISTRAL_API_KEY``.
   - **xai** — xAI Grok STT API, requires ``XAI_API_KEY``. High accuracy,
     Inverse Text Normalization, diarization, 21 languages.
+  - **yandex** — Yandex SpeechKit Sync API, requires ``YANDEX_API_KEY``.
+    Best Russian-language accuracy (~97%). Hard limits: 1 MB, 30s, mono, OGG/WAV only.
 
 Used by the messaging gateway to automatically transcribe voice messages
 sent by users on Telegram, Discord, WhatsApp, Slack, and Signal.
 
-Supported input formats: mp3, mp4, mpeg, mpga, m4a, wav, webm, ogg, aac
+Supported input formats: mp3, mp4, mpeg, mpga, m4a, wav, webm, ogg, oga, aac, flac
 
 Usage::
 
@@ -91,8 +93,10 @@ COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
 XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
+YANDEX_STT_URL = "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize"
+YANDEX_MAX_FILE_SIZE = 1 * 1024 * 1024  # 1 MB — Yandex SpeechKit Sync hard limit
 
-SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
+SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".oga", ".aac", ".flac"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 
@@ -273,9 +277,17 @@ def _get_provider(stt_config: dict) -> str:
             )
             return "none"
 
+        if provider == "yandex":
+            if get_env_value("YANDEX_API_KEY"):
+                return "yandex"
+            logger.warning(
+                "STT provider 'yandex' configured but YANDEX_API_KEY not set"
+            )
+            return "none"
+
         return provider  # Unknown — let it fail downstream
 
-    # --- Auto-detect (no explicit provider): local > groq > openai > xai ---
+    # --- Auto-detect (no explicit provider): local > groq > openai > xai > yandex ---
     # mistral is intentionally skipped while `mistralai` is quarantined on
     # PyPI (malicious 2.4.6 release on 2026-05-12).
 
@@ -292,6 +304,9 @@ def _get_provider(stt_config: dict) -> str:
     if get_env_value("XAI_API_KEY"):
         logger.info("No local STT available, using xAI Grok STT API")
         return "xai"
+    if get_env_value("YANDEX_API_KEY"):
+        logger.info("No local STT available, using Yandex SpeechKit API")
+        return "yandex"
     return "none"
 
 # ---------------------------------------------------------------------------
@@ -325,6 +340,73 @@ def _validate_audio_file(file_path: str) -> Optional[Dict[str, Any]]:
         return {"success": False, "transcript": "", "error": f"Failed to access file: {e}"}
 
     return None
+
+
+def _get_audio_duration_seconds(file_path: str) -> Optional[float]:
+    """Return audio duration in seconds via ffprobe, or None if unavailable."""
+    ffprobe = _find_binary("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", file_path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        raw = result.stdout.strip()
+        return float(raw) if raw else None
+    except Exception:
+        return None
+
+
+def _get_audio_channels(file_path: str) -> Optional[int]:
+    """Return number of audio channels via ffprobe, or None if unavailable."""
+    ffprobe = _find_binary("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "quiet", "-show_entries", "stream=channels",
+             "-of", "csv=p=0", "-select_streams", "a:0", file_path],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        raw = result.stdout.strip()
+        return int(raw) if raw else None
+    except Exception:
+        return None
+
+
+def _ensure_mono_for_yandex(file_path: str, work_dir: str) -> tuple[str, Optional[str]]:
+    """If file is stereo+, downmix to mono via ffmpeg into work_dir.
+
+    Returns (path_to_use, error_or_None). Caller is responsible for cleanup
+    when returned path differs from input.
+    """
+    channels = _get_audio_channels(file_path)
+    if channels is None or channels <= 1:
+        return file_path, None
+    ffmpeg = _find_binary("ffmpeg")
+    if not ffmpeg:
+        return file_path, (
+            f"Yandex SpeechKit requires mono audio but file has {channels} channel(s) "
+            "and ffmpeg is not installed."
+        )
+    suffix = Path(file_path).suffix.lower()
+    out_path = str(Path(work_dir) / f"yandex-mono{suffix}")
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-y", "-i", file_path, "-ac", "1", out_path],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if result.returncode != 0:
+            return file_path, f"ffmpeg downmix failed: {result.stderr[:200]}"
+        return out_path, None
+    except Exception as e:
+        return file_path, f"ffmpeg downmix exception: {e}"
+
 
 # ---------------------------------------------------------------------------
 # Provider: local (faster-whisper)
@@ -786,6 +868,175 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Provider: yandex (Yandex SpeechKit Sync API)
+# ---------------------------------------------------------------------------
+
+
+def _transcribe_yandex(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Transcribe using Yandex SpeechKit Sync API.
+
+    Sends raw binary audio to POST https://stt.api.cloud.yandex.net/speech/v1/stt:recognize
+    with Authorization: Api-Key header. Supports OGG/Opus (Telegram default) natively.
+    Requires YANDEX_API_KEY environment variable.
+    Hard limits: 1 MB, 30 seconds, mono audio.
+    """
+    import wave as _wave
+
+    api_key = get_env_value("YANDEX_API_KEY")
+    if not api_key:
+        return {"success": False, "transcript": "", "error": "YANDEX_API_KEY not set"}
+
+    stt_config = _load_stt_config()
+    yandex_cfg = stt_config.get("yandex", {})
+
+    language = str(yandex_cfg.get("language", "ru-RU")).strip()
+    topic = str(yandex_cfg.get("topic", "general")).strip()
+    folder_id = str(yandex_cfg.get("folder_id", "")).strip()
+    profanity_filter = is_truthy_value(yandex_cfg.get("profanity_filter", False))
+    raw_results = is_truthy_value(yandex_cfg.get("raw_results", False))
+
+    try:
+        import requests
+
+        # --- Size check (Yandex hard limit: 1 MB) ---
+        file_size = Path(file_path).stat().st_size
+        if file_size > YANDEX_MAX_FILE_SIZE:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": (
+                    f"Yandex SpeechKit: file too large "
+                    f"({file_size / (1024*1024):.2f} MB, limit is 1 MB). "
+                    "Use provider 'local' for longer recordings."
+                ),
+            }
+
+        # --- Duration check (Yandex hard limit: 30 seconds) ---
+        duration = _get_audio_duration_seconds(file_path)
+        if duration is not None and duration > 30.0:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": (
+                    f"Yandex SpeechKit: audio too long ({duration:.1f}s, limit is 30s). "
+                    "Use provider 'local' for longer recordings."
+                ),
+            }
+
+        # --- Format detection ---
+        suffix = Path(file_path).suffix.lower()
+        if suffix in {".ogg", ".oga"}:
+            audio_format = "oggopus"
+            params: Dict[str, str] = {"lang": language, "format": audio_format, "topic": topic}
+        elif suffix == ".wav":
+            audio_format = "lpcm"
+            try:
+                with _wave.open(file_path, "rb") as wf:
+                    sample_rate = wf.getframerate()
+                if sample_rate not in (8000, 16000, 48000):
+                    return {
+                        "success": False,
+                        "transcript": "",
+                        "error": (
+                            f"Yandex SpeechKit: WAV sample rate {sample_rate} Hz not supported "
+                            "(only 8000/16000/48000 are supported). Convert to OGG Opus with ffmpeg."
+                        ),
+                    }
+            except _wave.Error as e:
+                return {"success": False, "transcript": "", "error": f"Invalid WAV file: {e}"}
+            params = {
+                "lang": language,
+                "format": audio_format,
+                "sampleRateHertz": str(sample_rate),
+                "topic": topic,
+            }
+        else:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": (
+                    f"Yandex SpeechKit: unsupported format '{suffix}'. "
+                    "Supported: .ogg/.oga (OGG Opus) and .wav (PCM). Convert to OGG Opus with ffmpeg."
+                ),
+            }
+
+        if folder_id:
+            params["folderId"] = folder_id
+        if profanity_filter:
+            params["profanityFilter"] = "true"
+        if raw_results:
+            params["rawResults"] = "true"
+
+        # --- Ensure mono (Yandex requires 1 audio channel) ---
+        with tempfile.TemporaryDirectory(prefix="hermes-yandex-stt-") as work_dir:
+            send_path, mono_error = _ensure_mono_for_yandex(file_path, work_dir)
+            if mono_error:
+                return {"success": False, "transcript": "", "error": mono_error}
+
+            send_size = Path(send_path).stat().st_size
+            if send_size > YANDEX_MAX_FILE_SIZE:
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "error": (
+                        f"Yandex SpeechKit: file too large after mono downmix "
+                        f"({send_size / (1024*1024):.2f} MB, limit is 1 MB). "
+                        "Use provider 'local' for longer recordings."
+                    ),
+                }
+
+            with open(send_path, "rb") as audio_file:
+                audio_bytes = audio_file.read()
+
+        response = requests.post(
+            YANDEX_STT_URL,
+            headers={"Authorization": f"Api-Key {api_key}"},
+            params=params,
+            data=audio_bytes,
+            timeout=60,
+        )
+
+        if response.status_code != 200:
+            detail = ""
+            try:
+                err_body = response.json()
+                detail = (
+                    err_body.get("error_message", "")
+                    or err_body.get("message", "")
+                    or response.text[:300]
+                )
+            except Exception:
+                detail = response.text[:300]
+            return {
+                "success": False,
+                "transcript": "",
+                "error": f"Yandex SpeechKit API error (HTTP {response.status_code}): {detail}",
+            }
+
+        result = response.json()
+        transcript_text = result.get("result", "").strip()
+
+        if not transcript_text:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": "Yandex SpeechKit returned empty transcript",
+            }
+
+        logger.info(
+            "Transcribed %s via Yandex SpeechKit (lang=%s, topic=%s, %d chars)",
+            Path(file_path).name, language, topic, len(transcript_text),
+        )
+        return {"success": True, "transcript": transcript_text, "provider": "yandex"}
+
+    except PermissionError:
+        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
+    except Exception as e:
+        logger.error("Yandex SpeechKit transcription failed: %s", e, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"Yandex SpeechKit transcription failed: {e}"}
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -858,6 +1109,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         model_name = model or "grok-stt"
         return _transcribe_xai(file_path, model_name)
 
+    if provider == "yandex":
+        yandex_cfg = stt_config.get("yandex", {})
+        model_name = model or yandex_cfg.get("model", "speechkit-v3")
+        return _transcribe_yandex(file_path, model_name)
+
     # No provider available
     return {
         "success": False,
@@ -866,8 +1122,9 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             "No STT provider available. Install faster-whisper for free local "
             f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
             "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
-            "Voxtral Transcribe, set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY "
-            "or OPENAI_API_KEY for the OpenAI Whisper API."
+            "Voxtral Transcribe, set XAI_API_KEY for xAI Grok STT, "
+            "set YANDEX_API_KEY for Yandex SpeechKit, "
+            "or set VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY for the OpenAI Whisper API."
         ),
     }
 
