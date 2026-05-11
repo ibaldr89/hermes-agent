@@ -788,8 +788,10 @@ platform_toolsets:
 # Voice Transcription (Speech-to-Text)
 # =============================================================================
 # Automatically transcribe voice messages on messaging platforms.
-# Providers: local (free, faster-whisper) | groq (free tier) | openai (Whisper API) | mistral (Voxtral Transcribe)
-# Set the corresponding API key in .env: GROQ_API_KEY, OPENAI_API_KEY, or MISTRAL_API_KEY.
+# Providers: local (free, faster-whisper) | groq (free tier) | openai (Whisper API) |
+#            mistral (Voxtral Transcribe) | xai (Grok STT) | yandex (SpeechKit, best for Russian)
+# Set the corresponding API key in .env: GROQ_API_KEY, OPENAI_API_KEY, MISTRAL_API_KEY,
+# XAI_API_KEY, or YANDEX_API_KEY.
 stt:
   enabled: true
   # provider: "local"          # auto-detected if omitted
@@ -800,6 +802,14 @@ stt:
     model: "whisper-1"         # whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe
   # mistral:
   #   model: "voxtral-mini-latest"  # voxtral-mini-latest | voxtral-mini-2602
+  # xai:
+  #   model: "grok-stt-v1"     # xAI Grok STT model
+  # yandex:
+  #   language: "ru-RU"        # BCP-47 language code (default: ru-RU; also en-US, tr-TR, kk-KK)
+  #   topic: "general"         # general | general:rc | general:deprecated
+  #   folder_id: ""            # Yandex Cloud folder ID (optional, usually not needed with Api-Key)
+  #   profanity_filter: false  # Filter profanity
+  #   raw_results: false       # true = numbers as words, false = as digits
 
 # =============================================================================
 # Response Pacing (Messaging Platforms)
