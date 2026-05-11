@@ -2,7 +2,7 @@
 """
 Transcription Tools Module
 
-Provides speech-to-text transcription with seven providers:
+Provides speech-to-text transcription with eight providers:
 
   - **local** (default, free) — faster-whisper running locally, no API key needed.
     Auto-downloads the model (~150 MB for ``base``) on first use.
@@ -13,6 +13,8 @@ Provides speech-to-text transcription with seven providers:
     Inverse Text Normalization, diarization, 21 languages.
   - **yandex** — Yandex SpeechKit Sync API, requires ``YANDEX_API_KEY``.
     Best Russian-language accuracy (~97%). Hard limits: 1 MB, 30s, mono, OGG/WAV only.
+  - **hybrid_ru** — Auto-routes: short audio → Yandex (best accuracy), long audio →
+    local Whisper. Best Russian out-of-the-box experience.
 
 Used by the messaging gateway to automatically transcribe voice messages
 sent by users on Telegram, Discord, WhatsApp, Slack, and Signal.
@@ -285,12 +287,23 @@ def _get_provider(stt_config: dict) -> str:
             )
             return "none"
 
+        if provider == "hybrid_ru":
+            if _HAS_FASTER_WHISPER:
+                return "hybrid_ru"
+            logger.warning(
+                "STT provider 'hybrid_ru' configured but faster-whisper not installed"
+            )
+            return "none"
+
         return provider  # Unknown — let it fail downstream
 
-    # --- Auto-detect (no explicit provider): local > groq > openai > xai > yandex ---
+    # --- Auto-detect (no explicit provider): hybrid_ru > local > groq > openai > xai > yandex ---
     # mistral is intentionally skipped while `mistralai` is quarantined on
     # PyPI (malicious 2.4.6 release on 2026-05-12).
 
+    # hybrid_ru: local Whisper + Yandex key → best out-of-box experience for Russian
+    if _HAS_FASTER_WHISPER and get_env_value("YANDEX_API_KEY"):
+        return "hybrid_ru"
     if _HAS_FASTER_WHISPER:
         return "local"
     if _has_local_command():
@@ -1037,6 +1050,76 @@ def _transcribe_yandex(file_path: str, model_name: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Provider: hybrid_ru (Yandex for short audio, local Whisper for long audio)
+# ---------------------------------------------------------------------------
+
+
+def _transcribe_hybrid_ru(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Hybrid Russian STT: short audio → Yandex (best accuracy, fast),
+    long audio → local Whisper (handles >30s files Yandex can't).
+
+    Decision logic:
+      1. If YANDEX_API_KEY not set → fall through to local immediately.
+      2. If file size > 1 MB → local (Yandex hard limit).
+      3. If ffprobe gives duration > 28 seconds → local (Yandex hard limit is 30s; we use
+         28s as safety margin to account for ffprobe rounding / encoder differences).
+      4. If ffprobe gives channels > 1 AND ffmpeg unavailable → local.
+      5. Otherwise → Yandex. If Yandex returns error → log warning, fall back to local.
+
+    Returns same dict shape as other providers. Adds "routed_to" key: "yandex" or "local".
+    """
+    stt_config = _load_stt_config()
+    local_model = _normalize_local_model(
+        stt_config.get("local", {}).get("model", DEFAULT_LOCAL_MODEL)
+    )
+
+    yandex_key = get_env_value("YANDEX_API_KEY")
+
+    # Preflight (call ffprobe once, reuse results in both branches)
+    try:
+        file_size = Path(file_path).stat().st_size
+    except OSError:
+        file_size = 0
+
+    duration = _get_audio_duration_seconds(file_path)
+    channels = _get_audio_channels(file_path)
+
+    # Routing decision
+    use_local = False
+    if not yandex_key:
+        use_local = True
+    elif file_size > YANDEX_MAX_FILE_SIZE:
+        use_local = True
+    elif duration is not None and duration > 28.0:
+        use_local = True
+    elif channels is not None and channels > 1 and not _find_binary("ffmpeg"):
+        use_local = True
+
+    if use_local:
+        result = _transcribe_local(file_path, local_model)
+        result["routed_to"] = "local"
+        return result
+
+    # Try Yandex
+    yandex_result = _transcribe_yandex(file_path, "speechkit-v3")
+    if yandex_result.get("success"):
+        yandex_result["routed_to"] = "yandex"
+        return yandex_result
+
+    # Yandex failed — fall back to local Whisper
+    logger.warning(
+        "hybrid_ru: Yandex SpeechKit failed for %s (%s), falling back to local Whisper",
+        Path(file_path).name,
+        yandex_result.get("error", "unknown error"),
+    )
+    local_result = _transcribe_local(file_path, local_model)
+    local_result["routed_to"] = "local"
+    local_result["yandex_attempted"] = True
+    local_result["yandex_error"] = yandex_result.get("error", "")
+    return local_result
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -1113,6 +1196,13 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         yandex_cfg = stt_config.get("yandex", {})
         model_name = model or yandex_cfg.get("model", "speechkit-v3")
         return _transcribe_yandex(file_path, model_name)
+
+    if provider == "hybrid_ru":
+        local_cfg = stt_config.get("local", {})
+        model_name = _normalize_local_model(
+            model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+        )
+        return _transcribe_hybrid_ru(file_path, model_name)
 
     # No provider available
     return {

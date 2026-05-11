@@ -1754,12 +1754,35 @@ class TestGetProviderYandex:
             from tools.transcription_tools import _get_provider
             assert _get_provider({}) == "xai"
 
+    def test_auto_detect_hybrid_ru_when_local_and_yandex(self, monkeypatch):
+        """Auto-detect: hybrid_ru when both faster-whisper and YANDEX_API_KEY present."""
+        monkeypatch.setenv("YANDEX_API_KEY", "test-key")
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({}) == "hybrid_ru"
+
     def test_auto_detect_local_when_faster_whisper_no_yandex(self, monkeypatch):
         """Auto-detect: plain local when faster-whisper available but no Yandex key."""
         monkeypatch.delenv("YANDEX_API_KEY", raising=False)
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True):
             from tools.transcription_tools import _get_provider
             assert _get_provider({}) == "local"
+
+# ============================================================================
+# _get_provider — hybrid_ru explicit
+# ============================================================================
+
+class TestGetProviderHybridRu:
+    def test_hybrid_ru_explicit_with_faster_whisper(self):
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "hybrid_ru"}) == "hybrid_ru"
+
+    def test_hybrid_ru_explicit_no_faster_whisper_returns_none(self):
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "hybrid_ru"}) == "none"
+
 
 # ============================================================================
 # transcribe_audio — Yandex dispatch
@@ -1789,6 +1812,156 @@ class TestTranscribeAudioYandexDispatch:
 
         assert mock_yandex.call_args[0][1] == "speechkit-v3"
 
+
+
+# ============================================================================
+# _transcribe_hybrid_ru
+# ============================================================================
+
+class TestTranscribeHybridRu:
+    def test_routes_to_yandex_for_short_mono(self, monkeypatch, sample_oga):
+        monkeypatch.setenv("YANDEX_API_KEY", "test-key")
+
+        yandex_ok = {"success": True, "transcript": "привет", "provider": "yandex"}
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._get_audio_duration_seconds", return_value=20.0), \
+             patch("tools.transcription_tools._get_audio_channels", return_value=1), \
+             patch("tools.transcription_tools._transcribe_yandex", return_value=yandex_ok) as mock_yandex, \
+             patch("tools.transcription_tools._transcribe_local") as mock_local:
+            from tools.transcription_tools import _transcribe_hybrid_ru
+            result = _transcribe_hybrid_ru(sample_oga, "base")
+
+        mock_yandex.assert_called_once()
+        mock_local.assert_not_called()
+        assert result["routed_to"] == "yandex"
+        assert result["success"] is True
+
+    def test_routes_to_local_when_file_too_large(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("YANDEX_API_KEY", "test-key")
+
+        large_file = tmp_path / "large.ogg"
+        large_file.write_bytes(b"\x00" * (2 * 1024 * 1024))
+
+        local_ok = {"success": True, "transcript": "привет", "provider": "local"}
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._get_audio_duration_seconds", return_value=10.0), \
+             patch("tools.transcription_tools._get_audio_channels", return_value=1), \
+             patch("tools.transcription_tools._transcribe_yandex") as mock_yandex, \
+             patch("tools.transcription_tools._transcribe_local", return_value=local_ok) as mock_local:
+            from tools.transcription_tools import _transcribe_hybrid_ru
+            result = _transcribe_hybrid_ru(str(large_file), "base")
+
+        mock_yandex.assert_not_called()
+        mock_local.assert_called_once()
+        assert result["routed_to"] == "local"
+
+    def test_routes_to_local_when_duration_over_28s(self, monkeypatch, sample_oga):
+        monkeypatch.setenv("YANDEX_API_KEY", "test-key")
+
+        local_ok = {"success": True, "transcript": "длинный текст", "provider": "local"}
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._get_audio_duration_seconds", return_value=45.0), \
+             patch("tools.transcription_tools._get_audio_channels", return_value=1), \
+             patch("tools.transcription_tools._transcribe_yandex") as mock_yandex, \
+             patch("tools.transcription_tools._transcribe_local", return_value=local_ok) as mock_local:
+            from tools.transcription_tools import _transcribe_hybrid_ru
+            result = _transcribe_hybrid_ru(sample_oga, "base")
+
+        mock_yandex.assert_not_called()
+        mock_local.assert_called_once()
+        assert result["routed_to"] == "local"
+
+    def test_routes_to_local_when_no_yandex_key(self, monkeypatch, sample_oga):
+        monkeypatch.delenv("YANDEX_API_KEY", raising=False)
+
+        local_ok = {"success": True, "transcript": "привет", "provider": "local"}
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._get_audio_duration_seconds", return_value=10.0), \
+             patch("tools.transcription_tools._get_audio_channels", return_value=1), \
+             patch("tools.transcription_tools._transcribe_yandex") as mock_yandex, \
+             patch("tools.transcription_tools._transcribe_local", return_value=local_ok):
+            from tools.transcription_tools import _transcribe_hybrid_ru
+            result = _transcribe_hybrid_ru(sample_oga, "base")
+
+        mock_yandex.assert_not_called()
+        assert result["routed_to"] == "local"
+
+    def test_yandex_failure_falls_back_to_local(self, monkeypatch, sample_oga):
+        monkeypatch.setenv("YANDEX_API_KEY", "test-key")
+
+        yandex_fail = {"success": False, "transcript": "", "error": "API error 500"}
+        local_ok = {"success": True, "transcript": "привет", "provider": "local"}
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._get_audio_duration_seconds", return_value=10.0), \
+             patch("tools.transcription_tools._get_audio_channels", return_value=1), \
+             patch("tools.transcription_tools._transcribe_yandex", return_value=yandex_fail), \
+             patch("tools.transcription_tools._transcribe_local", return_value=local_ok) as mock_local:
+            from tools.transcription_tools import _transcribe_hybrid_ru
+            result = _transcribe_hybrid_ru(sample_oga, "base")
+
+        mock_local.assert_called_once()
+        assert result["routed_to"] == "local"
+        assert result["yandex_attempted"] is True
+        assert result["yandex_error"] == "API error 500"
+        assert result["success"] is True
+
+    def test_yandex_success_no_local_call(self, monkeypatch, sample_oga):
+        monkeypatch.setenv("YANDEX_API_KEY", "test-key")
+
+        yandex_ok = {"success": True, "transcript": "привет", "provider": "yandex"}
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._get_audio_duration_seconds", return_value=5.0), \
+             patch("tools.transcription_tools._get_audio_channels", return_value=1), \
+             patch("tools.transcription_tools._transcribe_yandex", return_value=yandex_ok), \
+             patch("tools.transcription_tools._transcribe_local") as mock_local:
+            from tools.transcription_tools import _transcribe_hybrid_ru
+            result = _transcribe_hybrid_ru(sample_oga, "base")
+
+        mock_local.assert_not_called()
+        assert result["routed_to"] == "yandex"
+
+    def test_ffprobe_unavailable_routes_to_yandex_if_under_size(self, monkeypatch, sample_oga):
+        """If duration check returns None (no ffprobe), small file should still try Yandex."""
+        monkeypatch.setenv("YANDEX_API_KEY", "test-key")
+
+        yandex_ok = {"success": True, "transcript": "тест", "provider": "yandex"}
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._get_audio_duration_seconds", return_value=None), \
+             patch("tools.transcription_tools._get_audio_channels", return_value=None), \
+             patch("tools.transcription_tools._transcribe_yandex", return_value=yandex_ok) as mock_yandex, \
+             patch("tools.transcription_tools._transcribe_local") as mock_local:
+            from tools.transcription_tools import _transcribe_hybrid_ru
+            result = _transcribe_hybrid_ru(sample_oga, "base")
+
+        mock_yandex.assert_called_once()
+        mock_local.assert_not_called()
+        assert result["routed_to"] == "yandex"
+
+
+
+# ============================================================================
+# transcribe_audio — hybrid_ru dispatch
+# ============================================================================
+
+class TestTranscribeAudioHybridRuDispatch:
+    def test_dispatches_to_hybrid_ru(self, sample_oga):
+        hybrid_ok = {"success": True, "transcript": "привет", "provider": "yandex", "routed_to": "yandex"}
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._get_provider", return_value="hybrid_ru"), \
+             patch("tools.transcription_tools._transcribe_hybrid_ru",
+                   return_value=hybrid_ok) as mock_hybrid:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_oga)
+
+        mock_hybrid.assert_called_once()
+        assert result["routed_to"] == "yandex"
 
 
 # ============================================================================
